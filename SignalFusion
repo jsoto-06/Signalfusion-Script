@@ -1,450 +1,545 @@
 //@version=6
-// SignalFusion Ultimate - Indicador Optimizado v3.0
-// Combina lo mejor de ambos scripts con doble confirmación
-// Resistencias/Soportes dinámicos mejorados
-// Modos adaptativos por timeframe
+// SignalFusion + ScalpStation + Soportes/Resistencias Dinámico
+// Unificado: versión 2.1 (v2.1) con correcciones y optimizaciones
+// Cambios:
+// - Corregido max/min por math.max/math.min.
+// - Reemplazado ta.adx por ta.dmi para calcular ADX (corrige error en línea 158).
+// - Añadido filtro ADX para señales en tendencia.
+// - Ajustados pesos de scoring para mejorar winrate.
+// - Aumentado atr_mult_tp_long para mejor RR.
+// - Optimizaciones menores para robustez.
 
-indicator('SignalFusion Ultimate v3.0', overlay=true, max_lines_count=500, max_labels_count=500)
+strategy('SignalFusion ScalpStation SR 1.0', overlay = true, max_lines_count = 500, max_labels_count = 500, initial_capital = 100, default_qty_type = strategy.percent_of_equity, default_qty_value = 50, commission_type = strategy.commission.percent, commission_value = 0.1)
 
-// ========================= INPUTS PRINCIPALES =========================
-// Modo de Trading con adaptación por timeframe
-mode = input.string('Standard', 'Modo Trading', options=['Conservative', 'Standard', 'Aggressive'], 
-  tooltip='Conservative: Menos señales, más seguras. Standard: Balance. Aggressive: Más señales, mayor riesgo')
+// ========================= INPUTS: GLOBAL =========================
+mode = input.string('Standard', 'Modo (riesgo)', options = ['Conservative', 'Standard', 'Aggressive'])
+use_ema = input.bool(false, 'Usar EMA en lugar de SMA (global)')
+show_signals = input.bool(true, 'Mostrar señales (triángulos)')
+show_sl_tp_markers = input.bool(true, 'Mostrar etiquetas SL/TP en entrada')
+show_sl_tp_lines = input.bool(true, 'Dibujar líneas SL/TP extendidas')
+auto_clear_bars = input.int(500, 'Auto-borrar SL/TP después de (barras, 0 desactivar)', minval = 0)
+line_extend_bars = input.int(300, 'Longitud visual línea (barras)', minval = 10, maxval = 2000)
+sr_max_age_bars = input.int(1000, 'Edad máxima de niveles S/R (barras, para borrar antiguos)', minval = 100)
 
-// Configuración visual
-show_signals = input.bool(true, 'Mostrar Señales', group='Visual')
-show_sl_tp_markers = input.bool(true, 'Mostrar SL/TP Labels', group='Visual')
-show_sl_tp_lines = input.bool(true, 'Mostrar Líneas SL/TP', group='Visual')
-show_debug_info = input.bool(true, 'Mostrar Info Debug', group='Visual')
-show_sr_lines = input.bool(true, 'Mostrar Líneas S/R', group='Visual')  // Nueva opción para mostrar/ocultar S/R
+// ========================= INPUTS: INDICADORES =========================
+// RSI
+rsi_base_len = input.int(14, 'RSI base length', minval = 2)
+rsi_ma_length = input.int(7, 'RSI MA length', minval = 3)
+// Bollinger
+bb_length = input.int(20, 'BB length')
+bb_stddev = input.float(2.0, 'BB stddev', step = 0.1)
+// Tendencia
+trend_length = input.int(50, 'Trend MA length')
+// MACD
+macd_fast = input.int(12, 'MACD fast')
+macd_slow = input.int(26, 'MACD slow')
+macd_signal_len = input.int(9, 'MACD signal length')
+// EMAs (scalp stations)
+ema_fast_len = input.int(9, 'EMA Fast', minval = 3)
+ema_slow_len = input.int(21, 'EMA Slow', minval = 5)
+ema_mid_len = input.int(50, 'EMA Mid', minval = 10)
+ema_macro_len = input.int(200, 'EMA Macro', minval = 50)
+// ADX
+adx_len = input.int(14, 'ADX length', minval = 2)
+adx_threshold = input.float(15, 'ADX threshold', minval = 10, step = 1)
 
-// Doble confirmación
-require_double_confirmation = input.bool(true, 'Requerir Doble Confirmación', group='Señales',
-  tooltip='Evita señales contradictorias en la misma vela')
-confirmation_bars = input.int(2, 'Barras para Confirmación', minval=1, maxval=5, group='Señales')
+// VWAP/OBV/Volume
+use_vwap_filter = input.bool(false, 'Usar VWAP como filtro (TF altos)')
+vwap_session = input.session('0000-2359', 'Sesión para reset VWAP')
+use_volume_filter = input.bool(true, 'Usar filtro de volumen')
+vol_ma_len = input.int(20, 'Volume SMA length')
+volume_mult = input.float(1.2, 'Volume multiplier threshold')
+use_obv_filter = input.bool(true, 'Usar OBV en scoring')
 
-// ========================= TIMEFRAME DETECTION =========================
+// ========================= INPUTS: RIESGO (ATR) =========================
+base_atr_sl = input.float(1.5, 'ATR SL base')
+base_atr_tp = input.float(2.0, 'ATR TP base')
+atr_multiplier_trailing = input.float(3.5, 'ATR multiplicador trailing')
+use_volatility_filter = input.bool(true, 'Usar filtro de volatilidad')
+volatility_atr_mult = input.float(1.1, 'Volatility ATR multiplier')
+
+// SL/TP separados para long/short
+atr_mult_sl_long = input.float(1.3, 'ATR SL multiplicador long')
+atr_mult_tp_long = input.float(4.0, 'ATR TP multiplicador long')
+atr_mult_sl_short = input.float(1.3, 'ATR SL multiplicador short')
+atr_mult_tp_short = input.float(3.0, 'ATR TP multiplicador short')
+
+// ========================= INPUTS: SEÑALES Y FILTROS =========================
+signal_threshold = input.float(2.0, 'Umbral de señal (score)', minval = 1.0, step = 0.5)
+use_time_filter = input.bool(true, 'Usar filtro de horario')
+session_hours = input.session('0900-1600', 'Horario de operación (session)')
+show_debug_info = input.bool(true, 'Mostrar info debug (shorts)')
+
+// Pesos configurables para scoring (ajustados para mejorar winrate)
+rsi_low_weight_long = input.float(2.5, 'RSI <35 weight LONG')
+rsi_oversold_up_weight_long = input.float(1.0, 'RSI <45 y subiendo weight LONG')
+ema_cross_weight_long = input.float(2.5, 'EMA fast/slow crossover weight LONG')
+ema_above_weight_long = input.float(1.0, 'EMA fast > slow y close > fast weight LONG')
+macd_hist_pos_weight_long = input.float(1.0, 'MACD hist >0 weight LONG')
+macd_hist_up_weight_long = input.float(0.5, 'MACD hist subiendo weight LONG')
+ema_mid_above_weight_long = input.float(0.5, 'Close > EMA mid weight LONG')
+ema_mid_bounce_weight_long = input.float(0.7, 'Low < EMA mid y close > mid weight LONG')
+bb_lower_weight_long = input.float(1.0, 'Close < BB lower weight LONG')
+trend_above_weight_long = input.float(0.5, 'Close > trend MA weight LONG')
+volume_weight_long = input.float(0.5, 'Volume filter weight LONG')
+vwap_above_weight_long = input.float(0.3, 'Close > VWAP weight LONG')
+obv_up_weight_long = input.float(0.5, 'OBV subiendo weight LONG')
+
+rsi_high_weight_short = input.float(2.5, 'RSI >65 weight SHORT')
+rsi_overbought_down_weight_short = input.float(2.0, 'RSI >60 y bajando weight SHORT')
+ema_crossunder_weight_short = input.float(2.5, 'EMA fast/slow crossunder weight SHORT')
+ema_below_weight_short = input.float(1.5, 'EMA fast < slow y close < fast weight SHORT')
+macd_hist_neg_weight_short = input.float(1.0, 'MACD hist <0 weight SHORT')
+macd_hist_down_weight_short = input.float(1.0, 'MACD hist bajando weight SHORT')
+bb_upper_weight_short = input.float(1.0, 'High > BB upper y close < upper weight SHORT')
+ema_mid_below_weight_short = input.float(0.5, 'Close < EMA mid weight SHORT')
+trend_below_weight_short = input.float(0.5, 'Close < trend MA weight SHORT')
+volume_weight_short = input.float(0.5, 'Volume filter weight SHORT')
+vwap_below_weight_short = input.float(0.3, 'Close < VWAP weight SHORT')
+obv_down_weight_short = input.float(0.5, 'OBV bajando weight SHORT')
+
+// ========================= INPUTS: SOPORTE/RESISTENCIA =========================
+pivotLen = input.int(15, 'Pivot length (para SR)', minval = 1)
+distanciaMin = input.float(50, 'Distancia mínima entre niveles (en ticks)', minval = 0.1)
+maxLineasTipo = input.int(4, 'Máximo de líneas visibles por tipo', minval = 1, maxval = 50)
+mostrarSoporteFuerte = input.bool(true, 'Mostrar Soporte Fuerte (mínimo del pivot)')
+mostrarResistenciaIntra = input.bool(true, 'Mostrar Resistencia Intradía')
+mark_strongest_only = input.bool(false, 'Marcar solo niveles con N toques')
+touch_lookback = input.int(300, 'Lookback (barras) para contar toques', minval = 50)
+touch_min_count = input.int(3, 'Mínimo toques para considerar fuerte', minval = 1)
+touch_tol_ticks = input.float(5.0, 'Tolerancia para contar toques (ticks)')
+
+// ========================= TIMEFRAME ADAPTIVE =========================
 _tf = timeframe.period
 is_1m = _tf == '1' or _tf == '1S'
 is_5m = _tf == '5'
 is_15m = _tf == '15'
 is_30m = _tf == '30'
-is_45m = _tf == '45'
 is_1h = _tf == '60' or str.upper(_tf) == '1H'
-is_2h = _tf == '120' or str.upper(_tf) == '2H'
-is_4h = _tf == '240' or str.upper(_tf) == '4H'
 
-// ========================= INPUTS ADAPTATIVOS =========================
-// Inputs base (se ajustarán después según timeframe)
-rsi_len = input.int(14, 'RSI Length', minval=5, maxval=30, group='Indicadores')
-bb_length = input.int(20, 'Bollinger Length', minval=10, maxval=50, group='Indicadores')
-bb_stddev = input.float(2.0, 'BB Desviación', step=0.1, minval=1.5, maxval=3.0, group='Indicadores')
-ema_fast_len = input.int(12, 'EMA Rápida', minval=5, group='EMAs')
-ema_slow_len = input.int(26, 'EMA Lenta', minval=10, group='EMAs')
-ema_mid_len = input.int(50, 'EMA Media', minval=20, group='EMAs')
-ema_trend_len = input.int(200, 'EMA Tendencia', minval=50, group='EMAs')
+rsi_len = is_1m ? rsi_base_len > 5 ? 5 : rsi_base_len : is_5m ? rsi_base_len : is_15m ? math.max(7, rsi_base_len) : is_30m ? math.max(8, rsi_base_len) : rsi_base_len
+atr_mult_sl = is_1m ? base_atr_sl * 1.25 : is_5m ? base_atr_sl * 1.2 : is_15m ? base_atr_sl * 1.05 : is_30m ? base_atr_sl * 1.0 : base_atr_sl * 0.95
+atr_mult_tp = is_1m ? base_atr_tp * 1.6 : is_5m ? base_atr_tp * 1.5 : is_15m ? base_atr_tp * 1.25 : is_30m ? base_atr_tp * 1.15 : base_atr_tp
 
-// ========================= ADAPTIVE ADJUSTMENTS =========================
-// Ajustar parámetros según timeframe
-rsi_len_adapted = is_1m ? 8 : is_5m ? 12 : is_15m ? math.max(rsi_len, 14) : is_30m ? math.max(rsi_len, 14) : is_45m ? math.max(rsi_len, 16) : is_1h ? math.max(rsi_len, 18) : is_2h ? math.max(rsi_len, 21) : rsi_len
-
-bb_length_adapted = is_1m ? math.max(bb_length-4, 16) : is_5m ? math.max(bb_length-2, 18) : is_15m ? bb_length : is_30m ? bb_length : is_45m ? bb_length+2 : is_1h ? bb_length+4 : is_2h ? bb_length+6 : bb_length
-
-ema_fast_adapted = is_1m ? math.max(ema_fast_len-4, 8) : is_5m ? math.max(ema_fast_len-3, 9) : is_15m ? ema_fast_len : is_30m ? ema_fast_len+3 : is_45m ? ema_fast_len+6 : is_1h ? ema_fast_len+9 : is_2h ? ema_fast_len+14 : ema_fast_len
-
-ema_slow_adapted = is_1m ? math.max(ema_slow_len-8, 18) : is_5m ? math.max(ema_slow_len-5, 21) : is_15m ? ema_slow_len : is_30m ? ema_slow_len+4 : is_45m ? ema_slow_len+9 : is_1h ? ema_slow_len+16 : is_2h ? ema_slow_len+24 : ema_slow_len
-
-// MACD con valores fijos por defecto (luego se adaptarán)
-macd_fast_input = input.int(12, 'MACD Rápido', group='MACD')
-macd_slow_input = input.int(26, 'MACD Lento', group='MACD')
-macd_signal = input.int(9, 'MACD Señal', group='MACD')
-
-// Adaptar MACD según timeframe
-macd_fast = is_1m ? math.max(macd_fast_input-2, 10) : is_5m ? macd_fast_input : macd_fast_input
-macd_slow = is_1m ? math.max(macd_slow_input-4, 22) : is_5m ? macd_slow_input : macd_slow_input
-
-// ========================= MODE ADJUSTMENTS BALANCEADOS =========================
-// Umbrales base por timeframe - BALANCEADOS
-base_long_threshold = is_1m ? 3.8 : is_5m ? 3.5 : is_15m ? 3.2 : is_30m ? 3.0 : is_45m ? 2.8 : is_1h ? 2.6 : is_2h ? 2.4 : 3.0
-base_short_threshold = is_1m ? 3.8 : is_5m ? 3.5 : is_15m ? 3.2 : is_30m ? 3.0 : is_45m ? 2.8 : is_1h ? 2.6 : is_2h ? 2.4 : 3.0
-
-// Balance de señales
-signal_balance = input.string('Balanced', 'Balance de Señales', options=['Long Bias', 'Balanced', 'Short Bias'], group='Filtros', tooltip='Ajusta el balance entre señales long y short')
-
-// Ajustes por modo con mejor balance
-mode_mult = mode == 'Conservative' ? 1.3 : mode == 'Aggressive' ? 0.75 : 1.0
-
-long_threshold = base_long_threshold * mode_mult
-short_threshold = base_short_threshold * mode_mult
-
-// Balance adicional según configuración
-long_threshold := signal_balance == 'Long Bias' ? long_threshold * 0.9 : signal_balance == 'Short Bias' ? long_threshold * 1.1 : long_threshold
-short_threshold := signal_balance == 'Long Bias' ? short_threshold * 1.1 : signal_balance == 'Short Bias' ? short_threshold * 0.9 : short_threshold
-
-// ATR para SL/TP más conservador
-base_atr_sl = is_1m ? 1.4 : is_5m ? 1.4 : is_15m ? 1.2 : is_30m ? 1.1 : is_45m ? 1.0 : is_1h ? 0.9 : is_2h ? 0.8 : 1.1
-base_atr_tp = is_1m ? 2.4 : is_5m ? 2.4 : is_15m ? 2.0 : is_30m ? 1.9 : is_45m ? 1.8 : is_1h ? 1.7 : is_2h ? 1.6 : 2.0
-
-atr_sl_mult = mode == 'Conservative' ? base_atr_sl * 1.2 : 
-              mode == 'Aggressive' ? base_atr_sl * 0.85 : base_atr_sl
-              
-atr_tp_mult = mode == 'Conservative' ? base_atr_tp * 0.9 : 
-              mode == 'Aggressive' ? base_atr_tp * 1.3 : base_atr_tp
-
-// ========================= FILTROS =========================
-use_time_filter = input.bool(false, 'Filtro de Horario', group='Filtros')
-session_hours = input.session('0900-1600,1700-2000', 'Horario Trading', group='Filtros')  // Mejorado para múltiples sesiones
-use_volume_filter = input.bool(false, 'Filtro de Volumen', group='Filtros')
-volume_mult = input.float(1.2, 'Multiplicador Volumen', step=0.1, minval=0.5, maxval=3.0, group='Filtros')
-volume_length = input.int(20, 'Longitud SMA Volumen', minval=5, maxval=50, group='Filtros')
-use_volatility_filter = input.bool(false, 'Filtro Volatilidad', group='Filtros')
-volatility_mult = input.float(1.1, 'Multiplicador Volatilidad', step=0.1, minval=0.8, maxval=2.0, group='Filtros')
-
-// Filtros adicionales configurables
-use_trend_filter = input.bool(false, 'Filtro de Tendencia Principal', group='Filtros')
-min_atr_filter = input.bool(false, 'Filtro ATR Mínimo', group='Filtros')
-min_atr_value = input.float(0.0001, 'ATR Mínimo', step=0.0001, minval=0.0001, group='Filtros')  // Validación con minval
-
-// Nueva validación de parámetros
-min_distance_ticks = math.max(input.float(30, 'Distancia Mínima (ticks)', minval=5, group='S/R'), 5.0)  // Validación con math.max
-
-// ========================= SOPORTES/RESISTENCIAS MEJORADOS =========================
-pivot_len = input.int(15, 'Pivot Length', minval=5, maxval=50, group='S/R')
-max_lines = input.int(6, 'Máximo Líneas S/R', minval=2, maxval=15, group='S/R')
-sr_strength_min = input.int(2, 'Toques Mínimos', minval=1, maxval=5, group='S/R')
-sr_lookback = input.int(200, 'Lookback Toques', minval=50, maxval=500, group='S/R')
-sr_tolerance = input.float(8.0, 'Tolerancia Toques (ticks)', minval=2.0, group='S/R')
+// Mode adjustments
+long_threshold = 2.0
+short_threshold = 2.0
+if mode == 'Conservative'
+    long_threshold := 4.0
+    short_threshold := 4.5
+    atr_mult_sl := atr_mult_sl * 1.15
+    atr_mult_tp := atr_mult_tp * 0.95
+    atr_mult_tp
+else if mode == 'Aggressive'
+    long_threshold := 2.0
+    short_threshold := 2.5
+    atr_mult_sl := atr_mult_sl * 0.9
+    atr_mult_tp := atr_mult_tp * 1.25
+    atr_mult_tp
 
 // ========================= CÁLCULOS INDICADORES =========================
-// RSI y su MA (usando valores adaptados)
-rsi = ta.rsi(close, rsi_len_adapted)
-rsi_ma = ta.sma(rsi, 7)
+// RSI
+rsi = ta.rsi(close, rsi_len)
+rsi_ma = use_ema ? ta.ema(rsi, rsi_ma_length) : ta.sma(rsi, rsi_ma_length)
 
-// Bandas de Bollinger (usando valores adaptados)
-bb_middle = ta.sma(close, bb_length_adapted)
-bb_upper = bb_middle + bb_stddev * ta.stdev(close, bb_length_adapted)
-bb_lower = bb_middle - bb_stddev * ta.stdev(close, bb_length_adapted)
+// MA/Bollinger/Trend
+middle = use_ema ? ta.ema(close, bb_length) : ta.sma(close, bb_length)
+upper = middle + bb_stddev * ta.stdev(close, bb_length)
+lower = middle - bb_stddev * ta.stdev(close, bb_length)
+trend_ma = use_ema ? ta.ema(close, trend_length) : ta.sma(close, trend_length)
 
-// EMAs (usando valores adaptados)
-ema_fast = ta.ema(close, ema_fast_adapted)
-ema_slow = ta.ema(close, ema_slow_adapted)
-ema_mid = ta.ema(close, ema_mid_len)  // No adaptada, pero usada directamente
-ema_trend = ta.ema(close, ema_trend_len)  // No adaptada, pero usada directamente
+// EMAs (ScalpStation)
+ema_fast = ta.ema(close, ema_fast_len)
+ema_slow = ta.ema(close, ema_slow_len)
+ema_mid = ta.ema(close, ema_mid_len)
+ema_macro = ta.ema(close, ema_macro_len)
 
 // MACD
-[macd_line, macd_signal_line, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+[macd_line, macd_signal, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_signal_len)
 
-// ATR y filtros mejorados
+// ADX (usando ta.dmi)
+[diplus, diminus, adx_value] = ta.dmi(adx_len, adx_len)
+adx_filter = adx_value > adx_threshold
+
+// ATR/Volatility
 atr = ta.atr(14)
-vol_sma = ta.sma(volume, volume_length)
+volatility_filter = atr > ta.sma(atr, 14) * volatility_atr_mult
 
+// Volume
+vol_sma = ta.sma(volume, vol_ma_len)
+volume_filter = volume > vol_sma * volume_mult
 
+// VWAP con reset por sesión
+var float _vwap_pv = na
+var float _vwap_vol = na
+if not na(time(timeframe.period, vwap_session)) and time(timeframe.period, vwap_session)[1] == 0
+    _vwap_pv := hlc3 * volume
+    _vwap_vol := volume
+    _vwap_vol
+else
+    _vwap_pv := nz(_vwap_pv) + hlc3 * volume
+    _vwap_vol := nz(_vwap_vol) + volume
+    _vwap_vol
+vwap = _vwap_vol != 0 ? _vwap_pv / _vwap_vol : na
 
-// Filtros de confirmación más flexibles
-in_session = use_time_filter ? time(timeframe.period, session_hours) > 0 : true
-vol_ok = use_volume_filter ? volume > vol_sma * volume_mult : true
-vol_filter = use_volatility_filter ? atr > ta.sma(atr, 14) * volatility_mult : true
-atr_ok = min_atr_filter ? atr > min_atr_value : true
+// OBV
+var float obv_var = 0.0
+obv_var := nz(obv_var[1]) + (close > close[1] ? volume : close < close[1] ? -volume : 0)
+obv = obv_var
 
-// Combinar todos los filtros (sin trend_ok para evitar circularidad)
-all_filters_ok = in_session and vol_ok and vol_filter and atr_ok
+// Pivots (para SR)
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
 
-// ========================= SCORING SYSTEM BALANCEADO =========================
-// Pesos más balanceados por timeframe
-rsi_weight = is_1m ? 2.2 : is_5m ? 2.0 : is_15m ? 1.8 : is_30m ? 1.6 : is_45m ? 1.5 : is_1h ? 1.4 : is_2h ? 1.3 : 1.7
-ema_weight = is_1m ? 2.5 : is_5m ? 2.3 : is_15m ? 2.1 : is_30m ? 2.0 : is_45m ? 1.9 : is_1h ? 1.8 : is_2h ? 1.7 : 2.0
-bb_weight = is_1m ? 1.8 : is_5m ? 1.6 : is_15m ? 1.4 : is_30m ? 1.3 : is_45m ? 1.2 : is_1h ? 1.1 : is_2h ? 1.0 : 1.3
-macd_weight = is_1m ? 1.9 : is_5m ? 1.7 : is_15m ? 1.6 : is_30m ? 1.5 : is_45m ? 1.4 : is_1h ? 1.3 : is_2h ? 1.2 : 1.5
-
-// LONG Score - Mejorado y balanceado
+// ========================= LÓGICA DE SEÑALES (scoring) =========================
+// LONG signals con pesos
 long_score = 0.0
 if rsi < 35
-    long_score += rsi_weight * 1.0
-if rsi < 45 and rsi > rsi[1] and rsi > rsi_ma
-    long_score += rsi_weight * 0.7
+    long_score := long_score + rsi_low_weight_long
+    long_score
+if rsi < 45 and rsi > rsi[1]
+    long_score := long_score + rsi_oversold_up_weight_long
+    long_score
 if ta.crossover(ema_fast, ema_slow)
-    long_score += ema_weight * 1.2
+    long_score := long_score + ema_cross_weight_long
+    long_score
 if ema_fast > ema_slow and close > ema_fast
-    long_score += ema_weight * 0.6
-if close < bb_lower
-    long_score += bb_weight * 1.0
-if close < bb_middle and close[1] < bb_lower
-    long_score += bb_weight * 0.8
-if macd_hist > 0 and macd_hist > macd_hist[1]
-    long_score += macd_weight * 0.8
-if ta.crossover(macd_line, macd_signal_line)
-    long_score += macd_weight * 1.0
-if close > ema_trend and use_trend_filter
-    long_score += 0.6
+    long_score := long_score + ema_above_weight_long
+    long_score
+if macd_hist > 0
+    long_score := long_score + macd_hist_pos_weight_long
+    long_score
+if macd_hist > macd_hist[1]
+    long_score := long_score + macd_hist_up_weight_long
+    long_score
+if close > ema_mid
+    long_score := long_score + ema_mid_above_weight_long
+    long_score
 if low < ema_mid and close > ema_mid
-    long_score += 0.8
-// Condiciones adicionales para balance
-if rsi < 40 and close > ema_fast and ema_fast > ema_slow
-    long_score += 0.5
-if volume > vol_sma * volume_mult * 1.5 and not use_volume_filter
-    long_score += 0.4
+    long_score := long_score + ema_mid_bounce_weight_long
+    long_score
+if close < lower
+    long_score := long_score + bb_lower_weight_long
+    long_score
+if close > trend_ma
+    long_score := long_score + trend_above_weight_long
+    long_score
+if volume_filter
+    long_score := long_score + volume_weight_long
+    long_score
+if not na(vwap) and use_vwap_filter
+    long_score := long_score + (close > vwap ? vwap_above_weight_long : 0)
+    long_score
+if use_obv_filter and obv > obv[1]
+    long_score := long_score + obv_up_weight_long
+    long_score
 
-// SHORT Score - Mejorado y balanceado
+// SHORT signals con pesos
 short_score = 0.0
 if rsi > 65
-    short_score += rsi_weight * 1.0
-if rsi > 55 and rsi < rsi[1] and rsi < rsi_ma
-    short_score += rsi_weight * 0.7
+    short_score := short_score + rsi_high_weight_short
+    short_score
+if rsi > 60 and rsi < rsi[1]
+    short_score := short_score + rsi_overbought_down_weight_short
+    short_score
 if ta.crossunder(ema_fast, ema_slow)
-    short_score += ema_weight * 1.2
+    short_score := short_score + ema_crossunder_weight_short
+    short_score
 if ema_fast < ema_slow and close < ema_fast
-    short_score += ema_weight * 0.6
-if close > bb_upper
-    short_score += bb_weight * 1.0
-if close > bb_middle and close[1] > bb_upper
-    short_score += bb_weight * 0.8
-if macd_hist < 0 and macd_hist < macd_hist[1]
-    short_score += macd_weight * 0.8
-if ta.crossunder(macd_line, macd_signal_line)
-    short_score += macd_weight * 1.0
-if close < ema_trend and use_trend_filter
-    short_score += 0.6
-if high > ema_mid and close < ema_mid
-    short_score += 0.8
-// Condiciones adicionales para balance
-if rsi > 60 and close < ema_fast and ema_fast < ema_slow
-    short_score += 0.5
-if volume > vol_sma * volume_mult * 1.5 and not use_volume_filter
-    short_score += 0.4
+    short_score := short_score + ema_below_weight_short
+    short_score
+if macd_hist < 0
+    short_score := short_score + macd_hist_neg_weight_short
+    short_score
+if macd_hist < macd_hist[1]
+    short_score := short_score + macd_hist_down_weight_short
+    short_score
+if high > upper and close < upper
+    short_score := short_score + bb_upper_weight_short
+    short_score
+if close < ema_mid
+    short_score := short_score + ema_mid_below_weight_short
+    short_score
+if close < trend_ma
+    short_score := short_score + trend_below_weight_short
+    short_score
+if volume_filter
+    short_score := short_score + volume_weight_short
+    short_score
+if not na(vwap) and use_vwap_filter
+    short_score := short_score + (close < vwap ? vwap_below_weight_short : 0)
+    short_score
+if use_obv_filter and obv < obv[1]
+    short_score := short_score + obv_down_weight_short
+    short_score
 
-// ========================= DOBLE CONFIRMACIÓN =========================
-// Variables para tracking de señales previas
-var int last_signal_bar = na
-var string last_signal_type = ""
+// Final signals applying filters
+in_session = use_time_filter ? time(timeframe.period, session_hours) > 0 : true
+vol_ok = use_volatility_filter ? volatility_filter : true
+volu_ok = use_volume_filter ? volume_filter : true
 
-// Evitar señales contradictorias
-avoid_conflict = false
-if require_double_confirmation and not na(last_signal_bar)
-    bars_since_signal = bar_index - last_signal_bar
-    if bars_since_signal < confirmation_bars
-        avoid_conflict := true
+long_ok = long_score >= long_threshold and in_session and vol_ok and volu_ok and adx_filter
+short_ok = short_score >= short_threshold and in_session and vol_ok and volu_ok and adx_filter
 
-// Señales raw con filtros (sin trend filter)
-long_signal_raw = long_score >= long_threshold and all_filters_ok
-short_signal_raw = short_score >= short_threshold and all_filters_ok
+long_pulse = long_ok and not long_ok[1]
+short_pulse = short_ok and not short_ok[1]
 
-// Aplicar doble confirmación mejorada
-prevent_opposite = require_double_confirmation and not na(last_signal_bar) and (bar_index - last_signal_bar) < confirmation_bars
+// ========================= STRATEGY ENTRIES/EXITS =========================
+if long_pulse
+    strategy.entry('Long', strategy.long)
 
-// Señales finales con trend filter aplicado directamente (para evitar circularidad)
-long_signal = long_signal_raw and not (prevent_opposite and last_signal_type == "SHORT") and not short_signal_raw and (not use_trend_filter or close > ema_trend)
-short_signal = short_signal_raw and not (prevent_opposite and last_signal_type == "LONG") and not long_signal_raw and (not use_trend_filter or close < ema_trend)
+if short_pulse
+    strategy.entry('Short', strategy.short)
 
-// Actualizar tracking
-if long_signal
-    last_signal_bar := bar_index
-    last_signal_type := "LONG"
-if short_signal
-    last_signal_bar := bar_index
-    last_signal_type := "SHORT"
+strategy.exit('Exit Long', 'Long', stop = close - atr * atr_mult_sl_long * atr_mult_sl, limit = close + atr * atr_mult_tp_long * atr_mult_tp, trail_points = atr * atr_multiplier_trailing, trail_offset = atr * atr_mult_sl_long)
+strategy.exit('Exit Short', 'Short', stop = close + atr * atr_mult_sl_short * atr_mult_sl, limit = close - atr * atr_mult_tp_short * atr_mult_tp, trail_points = atr * atr_multiplier_trailing, trail_offset = atr * atr_mult_sl_short)
 
-// ========================= SL/TP MANAGEMENT =========================
-var float entry_price = na
-var float sl_price = na
-var float tp_price = na
-var string current_position = ""
-var int entry_bar = na
-
-if long_signal
-    entry_price := close
-    sl_price := close - atr * atr_sl_mult
-    tp_price := close + atr * atr_tp_mult
-    current_position := "LONG"
-    entry_bar := bar_index
-
-if short_signal
-    entry_price := close
-    sl_price := close + atr * atr_sl_mult
-    tp_price := close - atr * atr_tp_mult
-    current_position := "SHORT"
-    entry_bar := bar_index
-
-// Gestión de posiciones mejorada: Cerrar posición si se alcanza SL, TP o señal opuesta
-if current_position == "LONG" and (low <= sl_price or high >= tp_price or short_signal)
-    current_position := ""
-    entry_price := na
-    sl_price := na
-    tp_price := na
-
-if current_position == "SHORT" and (high >= sl_price or low <= tp_price or long_signal)
-    current_position := ""
-    entry_price := na
-    sl_price := na
-    tp_price := na
-
-// ========================= SOPORTES/RESISTENCIAS DINÁMICOS =========================
-var array<float> support_levels = array.new_float()
-var array<float> resistance_levels = array.new_float()
-var array<line> sr_lines = array.new_line()
-
-// Función para contar toques (optimizada con max_bars)
-count_touches(level, tolerance, max_bars) =>
-    count = 0
-    for i = 0 to math.min(max_bars, bar_index)
-        if math.abs(close[i] - level) <= tolerance * syminfo.mintick
-            count += 1
-    count
-
-// Función para verificar si un nivel ya existe
-level_exists(levels_array, new_level, min_dist) =>
-    exists = false
-    if array.size(levels_array) > 0
-        for i = 0 to array.size(levels_array) - 1
-            if math.abs(array.get(levels_array, i) - new_level) < min_dist * syminfo.mintick
-                exists := true
-                break
-    exists
-
-// Detectar pivots y crear niveles S/R
-pivot_high = ta.pivothigh(high, pivot_len, pivot_len)
-pivot_low = ta.pivotlow(low, pivot_len, pivot_len)
-
-// Ajuste dinámico de tolerancia
-sr_tolerance_dynamic = atr * 0.5 / syminfo.mintick
-
-if not na(pivot_high) and not level_exists(resistance_levels, pivot_high, min_distance_ticks)
-    touches = count_touches(pivot_high, sr_tolerance_dynamic, sr_lookback)  // Usando función optimizada y tolerancia dinámica
-    if touches >= sr_strength_min
-        array.push(resistance_levels, pivot_high)
-        if show_sr_lines  // Solo dibujar si está activado
-            new_line = line.new(
-              x1=bar_index[pivot_len], y1=pivot_high, 
-              x2=bar_index, y2=pivot_high,
-              extend=extend.right, color=color.new(color.red, 20), width=2)
-            array.push(sr_lines, new_line)
-        
-        // Mantener solo las líneas más fuertes y limpiar memoria
-        if array.size(resistance_levels) > max_lines
-            array.shift(resistance_levels)
-            if array.size(sr_lines) > 0
-                old_line = array.shift(sr_lines)
-                line.delete(old_line)
-
-if not na(pivot_low) and not level_exists(support_levels, pivot_low, min_distance_ticks)
-    touches = count_touches(pivot_low, sr_tolerance_dynamic, sr_lookback)  // Usando función optimizada y tolerancia dinámica
-    if touches >= sr_strength_min
-        array.push(support_levels, pivot_low)
-        if show_sr_lines  // Solo dibujar si está activado
-            new_line = line.new(
-              x1=bar_index[pivot_len], y1=pivot_low, 
-              x2=bar_index, y2=pivot_low,
-              extend=extend.right, color=color.new(color.green, 20), width=2)
-            array.push(sr_lines, new_line)
-        
-        if array.size(support_levels) > max_lines
-            array.shift(support_levels)
-            if array.size(sr_lines) > 0
-                old_line = array.shift(sr_lines)
-                line.delete(old_line)
-
-// ========================= PLOTS Y VISUALIZACIÓN =========================
-// EMAs
-plot(ema_fast, 'EMA Rápida', color=color.blue, linewidth=1)
-plot(ema_slow, 'EMA Lenta', color=color.red, linewidth=1)
-plot(ema_mid, 'EMA Media', color=color.orange, linewidth=2)
-plot(ema_trend, 'EMA Tendencia', color=color.purple, linewidth=2)
-
-// Bandas de Bollinger
-plot(bb_upper, 'BB Superior', color=color.gray)
-plot(bb_middle, 'BB Media', color=color.gray)
-plot(bb_lower, 'BB Inferior', color=color.gray)
-
-// Señales
-plotshape(show_signals and long_signal, 'Long Signal', shape.triangleup, 
-  location.belowbar, color.green, size=size.normal)
-plotshape(show_signals and short_signal, 'Short Signal', shape.triangledown, 
-  location.abovebar, color.red, size=size.normal)
-
-// SL/TP
-plot(sl_price, 'Stop Loss', color=color.red, style=plot.style_circles, linewidth=2)
-plot(tp_price, 'Take Profit', color=color.green, style=plot.style_circles, linewidth=2)
-
-// ========================= TABLA COMPACTA ESENCIAL + SL/TP DINÁMICOS =========================
-var table info_table = table.new(position.top_right, 2, 10, border_width=1, bgcolor=color.new(color.white, 85))
-
-// Variables persistentes
-var string last_entry_time = ""
+// ========================= SL/TP / MARKERS / TRAILING VISUAL =========================
+var string last_side = ''
 var float last_entry_price = na
-var string last_entry_type = ""
 var float last_sl = na
 var float last_tp = na
+var float last_trailing_sl = na
+var int last_entry_bar = na
+var int last_entry_time = na
 
-// Actualizar datos cuando hay señal
-if long_signal
-    last_entry_time := str.tostring(time, "yyyy-MM-dd HH:mm")
+var label entry_label = na
+var line entry_line = na
+var label sl_label = na
+var line sl_line = na
+var label tp_label = na
+var line tp_line = na
+
+f_delete_markers() =>
+    if not na(entry_label)
+        label.delete(entry_label)
+    if not na(entry_line)
+        line.delete(entry_line)
+    if not na(sl_label)
+        label.delete(sl_label)
+    if not na(sl_line)
+        line.delete(sl_line)
+    if not na(tp_label)
+        label.delete(tp_label)
+    if not na(tp_line)
+        line.delete(tp_line)
+
+bar_ms = timeframe.isintraday ? float(timeframe.multiplier) * 60000.0 : 86400000.0
+x2_time = int(time + bar_ms * line_extend_bars)
+
+if strategy.position_size > 0
+    new_sl = math.max(last_sl, close - atr * atr_mult_sl_long * atr_mult_sl)
+    if new_sl > last_trailing_sl
+        last_trailing_sl := new_sl
+        last_sl := new_sl
+        if show_sl_tp_markers and not na(sl_label)
+            label.set_y(sl_label, last_sl)
+            label.set_text(sl_label, 'SL\n' + str.tostring(last_sl, '#.######'))
+        if show_sl_tp_lines and not na(sl_line)
+            line.set_y1(sl_line, last_sl)
+            line.set_y2(sl_line, last_sl)
+else if strategy.position_size < 0
+    new_sl = math.min(last_sl, close + atr * atr_mult_sl_short * atr_mult_sl)
+    if new_sl < last_trailing_sl
+        last_trailing_sl := new_sl
+        last_sl := new_sl
+        if show_sl_tp_markers and not na(sl_label)
+            label.set_y(sl_label, last_sl)
+            label.set_text(sl_label, 'SL\n' + str.tostring(last_sl, '#.######'))
+        if show_sl_tp_lines and not na(sl_line)
+            line.set_y1(sl_line, last_sl)
+            line.set_y2(sl_line, last_sl)
+
+if long_pulse
+    last_side := 'LONG'
     last_entry_price := close
-    last_entry_type := "LONG"
-    last_sl := sl_price
-    last_tp := tp_price
+    last_sl := last_entry_price - atr * atr_mult_sl_long * atr_mult_sl
+    last_tp := last_entry_price + atr * atr_mult_tp_long * atr_mult_tp
+    last_trailing_sl := last_sl
+    last_entry_bar := bar_index
+    last_entry_time := int(time)
+    f_delete_markers()
+    entry_label := label.new(x = last_entry_time, y = last_entry_price, xloc = xloc.bar_time, yloc = yloc.price, text = 'LONG\n' + str.tostring(last_entry_price, '#.######'), style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+    if show_sl_tp_lines
+        entry_line := line.new(x1 = last_entry_time, y1 = last_entry_price, x2 = x2_time, y2 = last_entry_price, xloc = xloc.bar_time, extend = extend.none, color = color.new(color.green, 0), width = 1)
+        entry_line
+    if show_sl_tp_markers
+        sl_label := label.new(x = last_entry_time, y = last_sl, xloc = xloc.bar_time, yloc = yloc.price, text = 'SL\n' + str.tostring(last_sl, '#.######'), style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+        tp_label := label.new(x = last_entry_time, y = last_tp, xloc = xloc.bar_time, yloc = yloc.price, text = 'TP\n' + str.tostring(last_tp, '#.######'), style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+        if show_sl_tp_lines
+            sl_line := line.new(x1 = last_entry_time, y1 = last_sl, x2 = x2_time, y2 = last_sl, xloc = xloc.bar_time, extend = extend.none, color = color.new(color.red, 0), width = 1, style = line.style_dashed)
+            tp_line := line.new(x1 = last_entry_time, y1 = last_tp, x2 = x2_time, y2 = last_tp, xloc = xloc.bar_time, extend = extend.none, color = color.new(color.green, 0), width = 1, style = line.style_dashed)
+            tp_line
 
-if short_signal
-    last_entry_time := str.tostring(time, "yyyy-MM-dd HH:mm")
+if short_pulse
+    last_side := 'SHORT'
     last_entry_price := close
-    last_entry_type := "SHORT"
-    last_sl := sl_price
-    last_tp := tp_price
+    last_sl := last_entry_price + atr * atr_mult_sl_short * atr_mult_sl
+    last_tp := last_entry_price - atr * atr_mult_tp_short * atr_mult_tp
+    last_trailing_sl := last_sl
+    last_entry_bar := bar_index
+    last_entry_time := int(time)
+    f_delete_markers()
+    entry_label := label.new(x = last_entry_time, y = last_entry_price, xloc = xloc.bar_time, yloc = yloc.price, text = 'SHORT\n' + str.tostring(last_entry_price, '#.######'), style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+    if show_sl_tp_lines
+        entry_line := line.new(x1 = last_entry_time, y1 = last_entry_price, x2 = x2_time, y2 = last_entry_price, xloc = xloc.bar_time, extend = extend.none, color = color.new(color.red, 0), width = 1)
+        entry_line
+    if show_sl_tp_markers
+        sl_label := label.new(x = last_entry_time, y = last_sl, xloc = xloc.bar_time, yloc = yloc.price, text = 'SL\n' + str.tostring(last_sl, '#.######'), style = label.style_label_up, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+        tp_label := label.new(x = last_entry_time, y = last_tp, xloc = xloc.bar_time, yloc = yloc.price, text = 'TP\n' + str.tostring(last_tp, '#.######'), style = label.style_label_down, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+        if show_sl_tp_lines
+            sl_line := line.new(x1 = last_entry_time, y1 = last_sl, x2 = x2_time, y2 = last_sl, xloc = xloc.bar_time, extend = extend.none, color = color.new(color.red, 0), width = 1, style = line.style_dashed)
+            tp_line := line.new(x1 = last_entry_time, y1 = last_tp, x2 = x2_time, y2 = last_tp, xloc = xloc.bar_time, extend = extend.none, color = color.new(color.green, 0), width = 1, style = line.style_dashed)
+            tp_line
 
-if show_debug_info
-    // Fila 0 - Timeframe
-    table.cell(info_table, 0, 0, "Timeframe", bgcolor=color.blue, text_color=color.white)
-    table.cell(info_table, 1, 0, _tf, bgcolor=color.blue, text_color=color.white)
+if auto_clear_bars > 0 and not na(last_entry_bar)
+    if bar_index - last_entry_bar > auto_clear_bars
+        f_delete_markers()
+        last_entry_price := na
+        last_sl := na
+        last_tp := na
+        last_trailing_sl := na
+        last_entry_bar := na
+        last_entry_time := na
+        last_side := ''
+        last_side
 
-    // Fila 1 - Long Score
-    table.cell(info_table, 0, 1, "Long Score", text_color=color.rgb(30,221,78))
-    table.cell(info_table, 1, 1, str.tostring(long_score, "#.##"),
-      text_color=long_score >= long_threshold ? color.green : color.rgb(211,215,226))
+// ========================= PLOTS =========================
+plot(show_signals ? ema_fast : na, title = 'EMA Fast', linewidth = 1)
+plot(show_signals ? ema_slow : na, title = 'EMA Slow', linewidth = 1)
+plot(ema_mid, title = 'EMA Mid', linewidth = 2)
+plot(ema_macro, title = 'EMA Macro', linewidth = 1)
+plot(middle, title = 'BB Mid', linewidth = 1)
+plot(upper, title = 'BB Up', linewidth = 1)
+plot(lower, title = 'BB Down', linewidth = 1)
+plot(vwap, title = 'VWAP', linewidth = 1)
 
-    // Fila 2 - Short Score
-    table.cell(info_table, 0, 2, "Short Score", text_color=color.rgb(212,215,223))
-    table.cell(info_table, 1, 2, str.tostring(short_score, "#.##"),
-      text_color=short_score >= short_threshold ? color.red : color.rgb(226,228,235))
+plotshape(show_signals and long_ok, title = 'Long Signal', style = shape.triangleup, location = location.belowbar, color = color.green, size = size.small)
+plotshape(show_signals and short_ok, title = 'Short Signal', style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small)
 
-    // Fila 3 - Umbrales
-    table.cell(info_table, 0, 3, "Umbrales", text_color=color.rgb(138,165,240))
-    table.cell(info_table, 1, 3, str.tostring(long_threshold, "#.#") + "/" + str.tostring(short_threshold, "#.#"),
-      text_color=color.rgb(96,131,228))
+plot(not na(last_sl) ? last_sl : na, title = 'Last SL', style = plot.style_circles)
+plot(not na(last_tp) ? last_tp : na, title = 'Last TP', style = plot.style_circles)
 
-    // Fila 4 - Posición actual
-    table.cell(info_table, 0, 4, "Posición", text_color=color.rgb(221,18,28))
-    table.cell(info_table, 1, 4, current_position == "" ? "—" : current_position,
-      text_color=current_position == "LONG" ? color.green : current_position == "SHORT" ? color.red : color.blue)
+// ========================= INFO TABLES =========================
+var table info = table.new(position.top_right, 2, 9, border_width = 1, bgcolor = color.new(color.white, 90))
+if barstate.islast
+    table.cell(info, 0, 0, 'Mode', text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(info, 1, 0, mode, text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(info, 0, 1, 'TF', text_color = color.black)
+    table.cell(info, 1, 1, _tf, text_color = color.blue)
+    table.cell(info, 0, 2, 'Scores', text_color = color.black)
+    table.cell(info, 1, 2, str.tostring(long_score, '#.#') + 'L / ' + str.tostring(short_score, '#.#') + 'S', text_color = color.black)
+    table.cell(info, 0, 3, 'Thresholds', text_color = color.black)
+    table.cell(info, 1, 3, str.tostring(long_threshold, '#.#') + 'L / ' + str.tostring(short_threshold, '#.#') + 'S', text_color = color.black)
+    table.cell(info, 0, 4, 'Entry', text_color = color.black)
+    table.cell(info, 1, 4, na(last_entry_price) ? '—' : str.tostring(last_entry_price, '#.######') + ' ' + last_side, text_color = color.black)
+    table.cell(info, 0, 5, 'SL / TP', text_color = color.black)
+    table.cell(info, 1, 5, (na(last_sl) ? '—' : str.tostring(last_sl, '#.######')) + ' / ' + (na(last_tp) ? '—' : str.tostring(last_tp, '#.######')), text_color = color.black)
+    table.cell(info, 0, 6, 'RSI / ATR', text_color = color.black)
+    table.cell(info, 1, 6, str.tostring(rsi, '#.0') + ' / ' + str.tostring(atr, '#.##'), text_color = color.black)
+    table.cell(info, 0, 7, 'Winrate', text_color = color.black)
+    table.cell(info, 1, 7, str.tostring(strategy.wintrades / math.max(1, strategy.closedtrades) * 100, '#.#') + '%', text_color = color.black)
+    table.cell(info, 0, 8, 'Profit Factor', text_color = color.black)
+    table.cell(info, 1, 8, str.tostring(strategy.grossprofit / math.max(1, strategy.grossloss), '#.#'), text_color = color.black)
 
-    // Fila 5 - Filtros
-    table.cell(info_table, 0, 5, "Filtros", text_color=color.rgb(133,159,230))
-    table.cell(info_table, 1, 5, (vol_ok ? "V✓" : "V✗") + " " + (vol_filter ? "Vol✓" : "Vol✗") + " " + (in_session ? "T✓" : "T✗"),
-      text_color=color.blue)
+// Debug info
+var table debug_info = table.new(position.top_left, 2, 8, border_width = 1, bgcolor = color.new(color.white, 90))
+if show_debug_info and barstate.islast
+    table.cell(debug_info, 0, 0, 'DEBUG', text_color = color.white, bgcolor = color.new(color.red, 0))
+    table.cell(debug_info, 1, 0, 'Status', text_color = color.white, bgcolor = color.new(color.red, 0))
+    table.cell(debug_info, 0, 1, 'RSI', text_color = color.black)
+    table.cell(debug_info, 1, 1, str.tostring(rsi, '#.##'), text_color = color.black)
+    table.cell(debug_info, 0, 2, 'EMA setup', text_color = color.black)
+    table.cell(debug_info, 1, 2, ema_fast < ema_slow ? 'Bajista' : 'Alcista', text_color = ema_fast < ema_slow ? color.red : color.green)
+    table.cell(debug_info, 0, 3, 'MACD hist', text_color = color.black)
+    table.cell(debug_info, 1, 3, str.tostring(macd_hist, '#.####'), text_color = macd_hist < 0 ? color.red : color.green)
+    table.cell(debug_info, 0, 4, 'Volume OK', text_color = color.black)
+    table.cell(debug_info, 1, 4, volu_ok ? 'OK' : 'Bajo', text_color = volu_ok ? color.green : color.gray)
+    table.cell(debug_info, 0, 5, 'OBV', text_color = color.black)
+    table.cell(debug_info, 1, 5, obv > obv[1] ? 'Up' : 'Down', text_color = obv > obv[1] ? color.green : color.red)
+    table.cell(debug_info, 0, 6, 'ADX', text_color = color.black)
+    table.cell(debug_info, 1, 6, str.tostring(adx_value, '#.##'), text_color = adx_filter ? color.green : color.gray)
+    table.cell(debug_info, 0, 7, 'Signals', text_color = color.black)
+    table.cell(debug_info, 1, 7, long_ok ? 'LONG' : short_ok ? 'SHORT' : '—', text_color = long_ok ? color.green : short_ok ? color.red : color.gray)
 
-    // Fila 6 - Vol Mult / ATR
-    table.cell(info_table, 0, 6, "Vol Mult/ATR", text_color=color.rgb(73,114,224))
-    table.cell(info_table, 1, 6, str.tostring(volume_mult, "#.#") + " / " + str.tostring(atr, "#.####"),
-      text_color=color.rgb(238,239,243))
+// ========================= SOPORTES / RESISTENCIAS DINÁMICAS =========================
+var array<float> soporteArr = array.new_float()
+var array<float> resistenciaArr = array.new_float()
+var array<line> todasLineas = array.new_line()
+var array<int> sr_timestamps = array.new_int()
 
-    // Fila 7 - Niveles S/R
-    int sr_count = array.size(support_levels) + array.size(resistance_levels)
-    table.cell(info_table, 0, 7, "S/R detectados", text_color=color.rgb(96,131,228))
-    table.cell(info_table, 1, 7, str.tostring(sr_count), text_color=color.rgb(96,131,228))
+f_nivel_cercano(_lista, _valor, _distMinTicks) =>
+    cercano = false
+    sz = array.size(_lista)
+    tick = syminfo.mintick
+    distMin = _distMinTicks * tick
+    if sz > 0
+        for i = 0 to sz - 1 by 1
+            if math.abs(array.get(_lista, i) - _valor) < distMin
+                cercano := true
+                cercano
+    cercano
 
-    // Fila 8 - SL / TP dinámicos
-    string sl_text = na(last_sl) ? "—" : "SL " + str.tostring(last_sl, format.mintick)
-    string tp_text = na(last_tp) ? "—" : "TP " + str.tostring(last_tp, format.mintick)
-    table.cell(info_table, 0, 8, "SL / TP", text_color=color.green)
-    table.cell(info_table, 1, 8, sl_text + " / " + tp_text, text_color=color.rgb(59, 231, 6))
+var array<float> close_history = array.new_float(touch_lookback)
+array.shift(close_history)
+array.push(close_history, close)
 
-    // Fila 9 (última en amarillo) - Precio de entrada
-    string last_price_display = na(last_entry_price) ? "—" : (last_entry_type + " @ " + str.tostring(last_entry_price, format.mintick))
-    table.cell(info_table, 0, 9, "Precio entrada", bgcolor=color.yellow, text_color=color.black)
-    table.cell(info_table, 1, 9, last_price_display, bgcolor=color.yellow, text_color=color.black)
+f_count_touches_opt(_level, _tolTicks) =>
+    cnt = 0
+    tol = _tolTicks * syminfo.mintick
+    for i = 0 to array.size(close_history) - 1 by 1
+        if math.abs(array.get(close_history, i) - _level) <= tol
+            cnt := cnt + 1
+            cnt
+    cnt
+
+f_draw_level(_arr, _val, _color, _width) =>
+    pivTime = time[pivotLen]
+    ln = line.new(x1 = pivTime, y1 = _val, x2 = time, y2 = _val, xloc = xloc.bar_time, extend = extend.right, color = _color, width = _width)
+    array.push(_arr, _val)
+    array.push(todasLineas, ln)
+    array.push(sr_timestamps, bar_index)
+    label.new(bar_index, _val, text = str.tostring(_val, format.mintick), color = _color, style = label.style_label_left, textcolor = color.black, size = size.tiny)
+    while array.size(_arr) > maxLineasTipo
+        array.shift(_arr)
+        if array.size(todasLineas) > 0
+            firstLine = array.shift(todasLineas)
+            line.delete(firstLine)
+        array.shift(sr_timestamps)
+
+if array.size(sr_timestamps) > 0
+    for i = array.size(sr_timestamps) - 1 to 0 by 1
+        if bar_index - array.get(sr_timestamps, i) > sr_max_age_bars
+            array.remove(sr_timestamps, i)
+            if i < array.size(soporteArr)
+                array.remove(soporteArr, i)
+            else if i < array.size(resistenciaArr)
+                array.remove(resistenciaArr, i - array.size(soporteArr))
+            if i < array.size(todasLineas)
+                line.delete(array.remove(todasLineas, i))
+
+if not na(ph)
+    if mostrarResistenciaIntra and not f_nivel_cercano(resistenciaArr, ph, distanciaMin)
+        touches = f_count_touches_opt(ph, touch_tol_ticks)
+        if not mark_strongest_only or touches >= touch_min_count
+            f_draw_level(resistenciaArr, ph, color.rgb(80, 4, 223), 2)
+
+if not na(pl)
+    if mostrarSoporteFuerte and not f_nivel_cercano(soporteArr, pl, distanciaMin)
+        touches = f_count_touches_opt(pl, touch_tol_ticks)
+        if not mark_strongest_only or touches >= touch_min_count
+            f_draw_level(soporteArr, pl, color.rgb(249, 250, 252), 2)
+
+// ========================= ALERTS AVANZADAS =========================
+alertcondition(long_pulse, title = 'Unified LONG (pulse)', message = 'LONG signal at {{close}}, SL={{plot("Last SL")}}, TP={{plot("Last TP")}}')
+alertcondition(short_pulse, title = 'Unified SHORT (pulse)', message = 'SHORT signal at {{close}}, SL={{plot("Last SL")}}, TP={{plot("Last TP")}}')
+
+sl_hit_long = strategy.position_size[1] > 0 and low <= last_sl
+tp_hit_long = strategy.position_size[1] > 0 and high >= last_tp
+sl_hit_short = strategy.position_size[1] < 0 and high >= last_sl
+tp_hit_short = strategy.position_size[1] < 0 and low <= last_tp
+
+alertcondition(sl_hit_long or sl_hit_short, title = 'SL Hit', message = 'SL hit on {{ticker}} at {{close}}')
+alertcondition(tp_hit_long or tp_hit_short, title = 'TP Hit', message = 'TP hit on {{ticker}} at {{close}}')
 
 
-
-
-// ========================= ALERTAS =========================
-alertcondition(long_signal, 'LONG Signal', 
-  'LONG señal en {{ticker}} a {{close}} - SL: {{plot("Stop Loss")}} TP: {{plot("Take Profit")}}')
-alertcondition(short_signal, 'SHORT Signal', 
-  'SHORT señal en {{ticker}} a {{close}} - SL: {{plot("Stop Loss")}} TP: {{plot("Take Profit")}}')
